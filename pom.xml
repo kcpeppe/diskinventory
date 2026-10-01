@@ -146,8 +146,8 @@
                                 <!-- Re-measured 2026-08-11 on /home/finkel (~741 GiB, far more nodes than /usr),
                                      5 rounds interleaved (serial, parallel, serial, ...) after a discarded warm-up
                                      scan so both binaries hit a warm page cache. Median of 5: serial 41.68s,
-                                     parallel 38.73s -- parallel 7.1% faster, above the 5% keep-the-flag bar.
-                                     (Best-of-5 alone was only 3.0% -- would not have cleared the bar; the
+                                     parallel 38.73s; parallel 7.1% faster, above the 5% keep-the-flag bar.
+                                     (Best-of-5 alone was only 3.0%, which would not have cleared the bar; the
                                      median is the number that decided this, not best-of. Supersedes the
                                      earlier /usr best-of-3 measurement, which was confounded by cache warmup:
                                      the runs weren't interleaved, so parallel benefited from a warmer cache.) -->

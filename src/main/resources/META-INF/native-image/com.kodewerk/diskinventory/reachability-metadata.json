@@ -1096,6 +1096,9 @@
       "type": "javafx.scene.image.Image"
     },
     {
+      "type": "javafx.scene.image.ImageView"
+    },
+    {
       "type": "javafx.scene.layout.Pane"
     },
     {
@@ -1278,6 +1281,10 @@
     {
       "module": "javafx.graphics",
       "glob": "com/sun/scenario/effect/impl/es2/glsl/LinearConvolveShadow_20.frag"
+    },
+    {
+      "module": "javafx.graphics",
+      "glob": "com/sun/scenario/effect/impl/es2/glsl/LinearConvolveShadow_28.frag"
     },
     {
       "module": "javafx.graphics",

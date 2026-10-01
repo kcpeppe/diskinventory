@@ -51,4 +51,12 @@ final class LazyDirectoryItem extends TreeItem<Path> {
         }
         return super.getChildren();
     }
+
+    /** Forgets the listing; it is re-read on the next {@link #getChildren()}, at once if expanded. */
+    void reload() {
+        loaded = false;
+        if (isExpanded()) {
+            getChildren();
+        }
+    }
 }

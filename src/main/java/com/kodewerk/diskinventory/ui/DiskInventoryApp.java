@@ -1,25 +1,34 @@
 package com.kodewerk.diskinventory.ui;
 
+import com.kodewerk.diskinventory.model.Deleter;
 import com.kodewerk.diskinventory.model.DirectoryNode;
 import com.kodewerk.diskinventory.model.DiskFree;
 import com.kodewerk.diskinventory.model.DiskUsageModel;
 import com.kodewerk.diskinventory.model.FileEntry;
 import com.kodewerk.diskinventory.model.FileRef;
+import com.kodewerk.diskinventory.model.Freed;
+import com.kodewerk.diskinventory.model.ScanResult;
 import com.kodewerk.diskinventory.model.SizeMode;
 import com.kodewerk.diskinventory.model.Sizes;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.concurrent.Task;
+import javafx.concurrent.WorkerStateEvent;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.chart.PieChart;
+import javafx.scene.control.Alert;
 import javafx.scene.control.Button;
+import javafx.scene.control.ButtonBar;
+import javafx.scene.control.ButtonType;
+import javafx.scene.control.ContextMenu;
 import javafx.scene.control.Hyperlink;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
+import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressIndicator;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
@@ -27,6 +36,9 @@ import javafx.scene.control.Tooltip;
 import javafx.scene.control.TreeCell;
 import javafx.scene.control.TreeItem;
 import javafx.scene.control.TreeView;
+import javafx.scene.input.KeyCode;
+import javafx.scene.input.MouseButton;
+import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
@@ -38,11 +50,17 @@ import javafx.stage.Stage;
 import javafx.util.Duration;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -57,6 +75,8 @@ public class DiskInventoryApp extends Application {
     private static final int TOOLTIP_MAX_LINES = 25;
     private static final double FILE_ROW_HEIGHT = 22;
     private static final int TOP_FILES = 50;
+    private static final String ANALYZE_TIP =
+            "Stop the current scan and analyze the directory it is scanning right now";
 
     private final DiskUsageModel model = new DiskUsageModel();
     private final List<DirectoryNode> trail = new ArrayList<>();
@@ -79,9 +99,15 @@ public class DiskInventoryApp extends Application {
     private TreeView<Path> dirTree;
     private boolean syncingTree;
 
-    private Task<DirectoryNode> currentTask;
+    private Task<?> currentTask;
+    /** Whether a click may cancel the running task to scan elsewhere: only a plain scan, nothing else loses work. */
+    private boolean pivotable;
+    private ScanResult result;
     private volatile Path scanningDir;
     private Path pivotTarget;
+    /** Non-null while a delete runs: its Stop flag. A delete is never cancelled — its rescan must run. */
+    private AtomicBoolean deleteStop;
+    private final boolean trashAvailable = Deleter.trashAvailable();
 
     @Override
     public void start(Stage stage) {
@@ -123,8 +149,19 @@ public class DiskInventoryApp extends Application {
         upButton.setOnAction(e -> up());
 
         rescanButton = new Button("↻");
-        rescanButton.setTooltip(new Tooltip("Rescan from the current root"));
-        rescanButton.setOnAction(e -> scan());
+        rescanButton.setTooltip(new Tooltip(
+                "Rescan the current directory (Shift-click: rescan everything from the scan root)"));
+        // A mouse handler, not onAction: ActionEvent does not carry the Shift state.
+        rescanButton.setOnMouseClicked(e -> {
+            if (e.getButton() != MouseButton.PRIMARY) {
+                return;
+            }
+            if (e.isShiftDown() || trail.isEmpty()) {
+                scan();
+            } else {
+                rescan(current().path());
+            }
+        });
 
         for (Button b : List.of(upButton, rescanButton)) {
             b.getStyleClass().add("tool-icon");
@@ -227,20 +264,20 @@ public class DiskInventoryApp extends Application {
 
     /** Walks the scan root up to {@code target}, grafting at each level. */
     private void walkUpTo(Path target) {
-        DirectoryNode top = trail.getFirst();
-        if (top.path().equals(target) || !top.path().startsWith(target)) {
+        ScanResult top = result;
+        if (top.root().path().equals(target) || !top.root().path().startsWith(target)) {
             return;
         }
-        runScan(new Task<>() {
+        runTask(new Task<>() {
             @Override
-            protected DirectoryNode call() throws Exception {
-                DirectoryNode node = top;
-                while (!node.path().equals(target)) {
+            protected ScanResult call() throws Exception {
+                ScanResult node = top;
+                while (!node.root().path().equals(target)) {
                     node = model.scanParent(node, progressReporter(this::updateMessage));
                 }
                 return node;
             }
-        });
+        }, false);
     }
 
     private HBox buildStatusRow() {
@@ -248,9 +285,14 @@ public class DiskInventoryApp extends Application {
         spinner.setPrefSize(16, 16);
 
         analyzeButton = new Button("Analyze this path");
-        analyzeButton.setTooltip(new Tooltip(
-                "Stop the current scan and analyze the directory it is scanning right now"));
-        analyzeButton.setOnAction(e -> pivotToScanningDir());
+        analyzeButton.setTooltip(new Tooltip(ANALYZE_TIP));
+        analyzeButton.setOnAction(e -> {
+            if (deleteStop != null) {
+                deleteStop.set(true);
+            } else {
+                pivotToScanningDir();
+            }
+        });
 
         status = new Label();
         HBox statusRow = new HBox(8, spinner, status, analyzeButton);
@@ -289,20 +331,39 @@ public class DiskInventoryApp extends Application {
                         setText(null);
                         setTooltip(null);
                     } else {
+                        String links = ref.otherLinks().isEmpty() ? ""
+                                : "  ⛓ +" + ref.otherLinks().size() + " links";
                         setText(String.format("%9s  %s",
-                                Sizes.human(ref.file().size(mode)), ref.file().name()));
-                        Tooltip tip = new Tooltip(ref.path().toString());
+                                Sizes.human(ref.file().size(mode)), ref.file().name()) + links);
+                        List<Path> lines = new ArrayList<>();
+                        lines.add(ref.path());
+                        lines.addAll(ref.otherLinks());
+                        Tooltip tip = new Tooltip(capped(lines));
                         tip.setShowDelay(Duration.millis(200));
                         setTooltip(tip);
                     }
                 }
             };
             cell.setOnMouseClicked(e -> {
-                if (cell.getItem() != null) {
+                if (cell.getItem() != null && isPlainPrimaryClick(e)) {
                     focusPath(cell.getItem().directory());
                 }
             });
+            cell.setOnContextMenuRequested(e -> {
+                if (cell.getItem() != null) {
+                    showMenu(pathMenu(cell.getItem().path(), false), cell, e.getScreenX(), e.getScreenY());
+                }
+                e.consume();
+            });
             return cell;
+        });
+        filesList.setOnKeyPressed(e -> {
+            FileRef ref = filesList.getSelectionModel().getSelectedItem();
+            // Mac keyboards' delete key sends BACK_SPACE.
+            if (ref != null && (e.getCode() == KeyCode.DELETE || e.getCode() == KeyCode.BACK_SPACE)) {
+                confirmAndDelete(Set.of(ref.path()), e.isShiftDown());
+                e.consume();
+            }
         });
         VBox.setVgrow(filesList, Priority.ALWAYS);
 
@@ -319,17 +380,32 @@ public class DiskInventoryApp extends Application {
         dirTree.getRoot().setExpanded(true);
         dirTree.getStyleClass().add("dir-tree");
         dirTree.setPrefWidth(260);
-        dirTree.setCellFactory(tv -> new TreeCell<>() {
-            @Override
-            protected void updateItem(Path path, boolean empty) {
-                super.updateItem(path, empty);
-                if (empty || path == null) {
-                    setText(null);
-                } else {
-                    Path name = path.getFileName();
-                    setText(name != null ? name.toString() : path.toString());
+        dirTree.setCellFactory(tv -> {
+            TreeCell<Path> cell = new TreeCell<>() {
+                @Override
+                protected void updateItem(Path path, boolean empty) {
+                    super.updateItem(path, empty);
+                    if (empty || path == null) {
+                        setText(null);
+                    } else {
+                        Path name = path.getFileName();
+                        setText(name != null ? name.toString() : path.toString());
+                    }
                 }
-            }
+            };
+            // Right-click must not select (selecting focuses, or even scans, the directory).
+            cell.addEventFilter(MouseEvent.MOUSE_PRESSED, e -> {
+                if (e.getButton() == MouseButton.SECONDARY || e.isPopupTrigger()) {
+                    e.consume();
+                }
+            });
+            cell.setOnContextMenuRequested(e -> {
+                if (cell.getItem() != null) {
+                    showMenu(pathMenu(cell.getItem(), true), cell, e.getScreenX(), e.getScreenY());
+                }
+                e.consume();
+            });
+            return cell;
         });
         dirTree.getSelectionModel().selectedItemProperty().addListener((obs, old, item) -> {
             if (!syncingTree && item != null) {
@@ -347,26 +423,13 @@ public class DiskInventoryApp extends Application {
         }
         syncingTree = true;
         try {
-            TreeItem<Path> item = dirTree.getRoot();
-            if (!target.startsWith(item.getValue())) {
-                return;
+            TreeItem<Path> item = findTreeItem(target);
+            if (item == null) {
+                return;     // branch not listable; leave the tree as it is
             }
-            Path rel = item.getValue().relativize(target);
-            if (!rel.toString().isEmpty()) {
-                outer:
-                for (Path name : rel) {
-                    item.setExpanded(true);
-                    for (TreeItem<Path> child : item.getChildren()) {
-                        Path childName = child.getValue().getFileName();
-                        if (childName != null && childName.toString().equals(name.toString())) {
-                            item = child;
-                            continue outer;
-                        }
-                    }
-                    return;     // branch not listable; leave the tree as it is
-                }
+            for (TreeItem<Path> i = item; i != null; i = i.getParent()) {
+                i.setExpanded(true);
             }
-            item.setExpanded(true);
             dirTree.getSelectionModel().select(item);
             int row = dirTree.getRow(item);
             if (row >= 0) {
@@ -374,6 +437,371 @@ public class DiskInventoryApp extends Application {
             }
         } finally {
             syncingTree = false;
+        }
+    }
+
+    /** The tree item for {@code target}, listing directories on the way; null if not listable. */
+    private TreeItem<Path> findTreeItem(Path target) {
+        TreeItem<Path> item = dirTree.getRoot();
+        if (!target.startsWith(item.getValue())) {
+            return null;
+        }
+        outer:
+        for (Path name : item.getValue().relativize(target)) {
+            if (name.toString().isEmpty()) {
+                break;      // target is the tree root
+            }
+            for (TreeItem<Path> child : item.getChildren()) {
+                Path childName = child.getValue().getFileName();
+                if (childName != null && childName.toString().equals(name.toString())) {
+                    item = child;
+                    continue outer;
+                }
+            }
+            return null;
+        }
+        return item;
+    }
+
+    /** Re-lists {@code dir}'s subdirectories in the tree after the disk changed under it. */
+    private void reloadTreeItem(Path dir) {
+        if (dir == null) {
+            return;
+        }
+        syncingTree = true;
+        try {
+            // Else revealInTree sees a stale selection of the same path and returns early.
+            dirTree.getSelectionModel().clearSelection();
+            if (findTreeItem(dir) instanceof LazyDirectoryItem item) {
+                item.reload();
+            }
+        } finally {
+            syncingTree = false;
+        }
+        if (!trail.isEmpty()) {
+            revealInTree(current().path());
+        }
+    }
+
+    /**
+     * Right-click menu for a directory or file in the scanned tree: Rescan
+     * (directories only), Move to Trash and Delete permanently. Delete items
+     * are disabled for the scan root; everything is disabled while a task runs.
+     */
+    private ContextMenu pathMenu(Path p, boolean isDirectory) {
+        ContextMenu menu = new ContextMenu();
+        if (result == null || !p.startsWith(result.root().path())) {
+            return menu;
+        }
+        if (isDirectory) {
+            MenuItem rescan = new MenuItem("Rescan");
+            rescan.setOnAction(e -> rescan(p));
+            menu.getItems().add(rescan);
+        }
+        List<MenuItem> deletes = new ArrayList<>();
+        if (trashAvailable) {
+            MenuItem trash = new MenuItem("Move to Trash");
+            trash.setOnAction(e -> confirmAndDelete(Set.of(p), false));
+            deletes.add(trash);
+        }
+        MenuItem permanent = new MenuItem("Delete permanently");
+        permanent.setOnAction(e -> confirmAndDelete(Set.of(p), true));
+        deletes.add(permanent);
+        menu.getItems().addAll(deletes);
+        boolean deletable = deletable(result.root().path(), p);
+        menu.setOnShowing(e -> {
+            boolean busy = busy();
+            menu.getItems().forEach(item -> item.setDisable(busy || deletes.contains(item) && !deletable));
+        });
+        return menu;
+    }
+
+    /** Whether {@code p} may be deleted: strictly under the scan root, never the root or above it. */
+    static boolean deletable(Path scanRoot, Path p) {
+        return p.startsWith(scanRoot) && !p.equals(scanRoot);
+    }
+
+    /**
+     * Not {@code isRunning()}: that turns true only once the task's SCHEDULED
+     * event is processed, so input already queued behind runTask would slip in.
+     */
+    private boolean busy() {
+        return currentTask != null && !currentTask.isDone();
+    }
+
+    /**
+     * Confirms, then deletes {@code targets} — to the Trash, or permanently —
+     * and rescans each of them whatever the outcome. Does nothing for the scan
+     * root or above it, or while a task runs. Cancel is the default button.
+     */
+    void confirmAndDelete(Set<Path> targets, boolean permanent) {
+        if (busy() || result == null || targets.isEmpty()
+                || !targets.stream().allMatch(t -> deletable(result.root().path(), t))) {
+            return;
+        }
+        List<Path> sorted = targets.stream().sorted().toList();
+        if (!permanent && !trashAvailable) {
+            offerPermanent(sorted, "No Trash is available on this system.");
+            return;
+        }
+        if (permanent) {
+            measureFreed(targets, freed -> confirmDelete(sorted, true, freed));
+        } else {
+            confirmDelete(sorted, false, null);
+        }
+    }
+
+    /**
+     * Works out what deleting {@code targets} frees on a background thread — it
+     * stats every shared inode, which is slow for a pnpm store — then hands it
+     * to {@code then} on the FX thread. Counts as the one running operation.
+     */
+    private void measureFreed(Set<Path> targets, Consumer<Freed> then) {
+        ScanResult at = result;
+        Task<Freed> task = new Task<>() {
+            @Override
+            protected Freed call() {
+                return model.freedOnDisk(at, targets);
+            }
+        };
+        currentTask = task;
+        pivotable = false;
+        String statusBefore = status.getText();
+        boolean upDisabled = upButton.isDisable();
+        upButton.setDisable(true);
+        rescanButton.setDisable(true);
+        showScanActivity(true);
+        analyzeButton.setVisible(false);
+        analyzeButton.setManaged(false);
+        status.setText("Working out what the delete frees…");
+        // Never cancelled; runs before the dialog, so the delete that follows can start.
+        Runnable finished = () -> {
+            currentTask = null;
+            upButton.setDisable(upDisabled);
+            rescanButton.setDisable(false);
+            showScanActivity(false);
+            status.setText(statusBefore);
+        };
+        task.setOnSucceeded(e -> {
+            finished.run();
+            then.accept(task.getValue());
+        });
+        task.setOnFailed(e -> {
+            finished.run();
+            status.setText("Could not work out what the delete frees: " + task.getException().getMessage());
+        });
+        Thread thread = new Thread(task, "freed-on-disk");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /** The confirmation dialog, then the delete. {@code freed} is null for the Trash. */
+    private void confirmDelete(List<Path> sorted, boolean permanent, Freed freed) {
+        if (busy()) {
+            return;
+        }
+        FileEntry file = sorted.size() == 1 ? fileAt(sorted.getFirst()) : null;
+        List<Path> links = file != null && file.shared() ? result.inodes().linksOf(file.fileKey()) : List.of();
+
+        ButtonType go = new ButtonType(permanent ? "Delete permanently" : "Move to Trash",
+                ButtonBar.ButtonData.OK_DONE);
+        ButtonType all = new ButtonType("Delete all " + links.size() + " links in the tree",
+                ButtonBar.ButtonData.OTHER);
+        Optional<ButtonType> choice = ask(Alert.AlertType.CONFIRMATION,
+                permanent ? "Delete permanently? This cannot be undone." : "Move to Trash?",
+                deleteSummary(sorted, bytesCounted(sorted), mode, permanent, freed),
+                links.size() > 1 ? List.of(go, all) : List.of(go));
+        if (choice.isEmpty() || busy()) {
+            return;
+        }
+        if (choice.get() == all) {
+            confirmAndDelete(new HashSet<>(links), permanent);     // its own confirmation, with its own numbers
+        } else if (choice.get() == go) {
+            runDelete(sorted, permanent);
+        }
+    }
+
+    /** The confirmation text: paths, bytes counted here, and what the delete frees. */
+    static String deleteSummary(List<Path> targets, long counted, SizeMode mode, boolean permanent, Freed freed) {
+        StringBuilder sb = new StringBuilder(capped(targets));
+        sb.append("\n\n").append(Sizes.human(counted))
+                .append(mode == SizeMode.ALLOCATED ? " on disk" : " logical").append(" counted here.\n");
+        if (!permanent) {
+            sb.append("In the Trash, space is not freed until the Trash is emptied.");
+        } else {
+            sb.append("This frees ").append(Sizes.human(freed.freed())).append(" on disk");
+            if (freed.staying() > 0) {
+                sb.append("; ").append(Sizes.human(freed.staying())).append(" stays (linked elsewhere)");
+            }
+            sb.append('.');
+        }
+        return sb.toString();
+    }
+
+    /** One path per line, at most {@link #TOOLTIP_MAX_LINES}. */
+    private static String capped(List<Path> paths) {
+        StringBuilder sb = new StringBuilder();
+        int shown = Math.min(paths.size(), TOOLTIP_MAX_LINES);
+        for (int i = 0; i < shown; i++) {
+            sb.append(i > 0 ? "\n" : "").append(paths.get(i));
+        }
+        if (paths.size() > shown) {
+            sb.append("\n… and ").append(paths.size() - shown).append(" more");
+        }
+        return sb.toString();
+    }
+
+    /** Bytes the tree counts for {@code targets} in the current mode; a shared file counts once. */
+    private long bytesCounted(List<Path> targets) {
+        long counted = 0;
+        Set<Object> seen = new HashSet<>();
+        for (Path t : targets) {
+            DirectoryNode dir = nodeAt(t);
+            FileEntry file = dir == null ? fileAt(t) : null;
+            if (dir != null) {
+                counted += dir.totalSize(mode);
+            } else if (file != null && (!file.shared() || seen.add(file.fileKey()))) {
+                counted += file.size(mode);
+            }
+        }
+        return counted;
+    }
+
+    private DirectoryNode nodeAt(Path p) {
+        DirectoryNode node = trailTo(result.root(), p).getLast();
+        return node.path().equals(p) ? node : null;
+    }
+
+    private FileEntry fileAt(Path p) {
+        DirectoryNode dir = p.getParent() == null ? null : nodeAt(p.getParent());
+        if (dir == null) {
+            return null;
+        }
+        String name = p.getFileName().toString();
+        return dir.files().stream().filter(f -> f.name().equals(name)).findFirst().orElse(null);
+    }
+
+    /** A dialog whose extra choices sit beside Cancel, which is the default button. */
+    private Optional<ButtonType> ask(Alert.AlertType type, String header, String text, List<ButtonType> choices) {
+        Alert alert = new Alert(type, text);
+        alert.initOwner(stage);
+        alert.setHeaderText(header);
+        alert.getButtonTypes().setAll(choices);
+        alert.getButtonTypes().add(ButtonType.CANCEL);
+        for (ButtonType bt : alert.getButtonTypes()) {
+            ((Button) alert.getDialogPane().lookupButton(bt)).setDefaultButton(bt == ButtonType.CANCEL);
+        }
+        return alert.showAndWait();
+    }
+
+    /** Trash failed or is missing: offer a permanent delete, which goes through its own confirmation. */
+    private void offerPermanent(List<Path> targets, String reason) {
+        ButtonType instead = new ButtonType("Delete permanently instead…", ButtonBar.ButtonData.OK_DONE);
+        Optional<ButtonType> choice = ask(Alert.AlertType.ERROR, "Could not move to Trash",
+                reason + "\n\n" + capped(targets) + "\n\nDelete permanently instead?", List.of(instead));
+        if (choice.isPresent() && choice.get() == instead) {
+            confirmAndDelete(new HashSet<>(targets), true);
+        }
+    }
+
+    /**
+     * Deletes on a background thread, then rescans each target whatever the
+     * outcome (and the Trash, when it lies under the scan root). Stop only
+     * sets a flag the permanent delete checks between files.
+     */
+    private void runDelete(List<Path> targets, boolean permanent) {
+        ScanResult before = result;
+        Path scanRoot = before.root().path();
+        AtomicBoolean stop = new AtomicBoolean();
+        // Written on the worker, read on the FX thread after success.
+        List<Path> failed = new ArrayList<>();
+        List<Path> untrashed = new ArrayList<>();
+        AtomicReference<String> trashError = new AtomicReference<>();
+        AtomicBoolean stopped = new AtomicBoolean();
+        List<String> rescanErrors = new ArrayList<>();
+        Task<ScanResult> task = new Task<>() {
+            @Override
+            protected ScanResult call() throws Exception {
+                boolean trashed = false;
+                for (Path t : targets) {
+                    if (permanent) {
+                        updateMessage("Deleting " + t);
+                        Deleter.Outcome outcome = Deleter.deletePermanently(t, stop::get);
+                        failed.addAll(outcome.failed());
+                        if (outcome.status() == Deleter.Status.STOPPED) {
+                            stopped.set(true);
+                            break;
+                        }
+                    } else if (trashError.get() == null) {
+                        updateMessage("Moving to Trash: " + t);
+                        try {
+                            Deleter.trash(t);
+                            trashed = true;
+                        } catch (IOException e) {
+                            trashError.set(e.getMessage());
+                            untrashed.add(t);
+                        }
+                    } else {
+                        untrashed.add(t);
+                    }
+                }
+                List<Path> toRescan = new ArrayList<>(targets);
+                if (trashed) {
+                    Deleter.trashDir().filter(d -> d.startsWith(scanRoot)).ifPresent(toRescan::add);
+                }
+                // A failed rescan must not lose the delete's outcome: keep going, report it after.
+                ScanResult r = before;
+                for (Path t : toRescan) {
+                    try {
+                        r = model.rescan(r, rescanTarget(r.root(), t), progressReporter(this::updateMessage));
+                    } catch (IOException | RuntimeException e) {
+                        rescanErrors.add(t + ": " + e.getMessage());
+                    }
+                }
+                return r;
+            }
+        };
+        task.addEventHandler(WorkerStateEvent.WORKER_STATE_SUCCEEDED, e -> {
+            targets.stream().map(Path::getParent).distinct().forEach(this::reloadTreeItem);
+            // After runTask's own success handler, so the view and result are current and no task runs.
+            Platform.runLater(() -> {
+                if (stopped.get()) {
+                    status.setText("Delete stopped — the view shows what is left");
+                }
+                if (!failed.isEmpty()) {
+                    Alert alert = new Alert(Alert.AlertType.ERROR, capped(failed));
+                    alert.initOwner(stage);
+                    alert.setHeaderText("Could not delete " + failed.size()
+                            + (failed.size() == 1 ? " path" : " paths"));
+                    alert.showAndWait();
+                }
+                if (!rescanErrors.isEmpty()) {
+                    Alert alert = new Alert(Alert.AlertType.ERROR, String.join("\n", rescanErrors)
+                            + "\n\nThe tree may not match the disk there until the next rescan (↻).");
+                    alert.initOwner(stage);
+                    alert.setHeaderText("Could not rescan after the delete");
+                    alert.showAndWait();
+                }
+                if (trashError.get() != null) {
+                    offerPermanent(untrashed, trashError.get());
+                }
+            });
+        });
+        runTask(task, true);
+        if (currentTask != task) {
+            return;
+        }
+        deleteStop = stop;
+        analyzeButton.setText("Stop");
+        analyzeButton.getTooltip().setText("Stop deleting; what is left stays in the view");
+        // Trash is a single call and can't be stopped.
+        analyzeButton.setVisible(permanent);
+        analyzeButton.setManaged(permanent);
+    }
+
+    private static void showMenu(ContextMenu menu, Node anchor, double screenX, double screenY) {
+        if (!menu.getItems().isEmpty()) {
+            menu.show(anchor, screenX, screenY);
         }
     }
 
@@ -385,7 +813,10 @@ public class DiskInventoryApp extends Application {
         if (trail.isEmpty()) {
             return;
         }
-        if (currentTask != null && currentTask.isRunning()) {
+        if (busy()) {
+            if (!pivotable) {
+                return;     // a rescan or delete would lose its work; a delete must rescan
+            }
             pivotTarget = target;
             currentTask.cancel(true);
             return;
@@ -393,40 +824,61 @@ public class DiskInventoryApp extends Application {
         if (target.equals(current().path())) {
             return;
         }
-        DirectoryNode scanRoot = trail.getFirst();
-        if (target.startsWith(scanRoot.path())) {
-            List<DirectoryNode> newTrail = new ArrayList<>();
-            newTrail.add(scanRoot);
-            DirectoryNode node = scanRoot;
-            boolean resolved = true;
-            Path rel = scanRoot.path().relativize(target);
-            if (!rel.toString().isEmpty()) {
-                for (Path name : rel) {
-                    var child = node.child(name.toString());
-                    if (child.isEmpty()) {
-                        resolved = false;
-                        break;
-                    }
-                    node = child.get();
-                    newTrail.add(node);
-                }
-            }
-            if (resolved) {
-                trail.clear();
-                trail.addAll(newTrail);
-                render();
-                return;
-            }
+        List<DirectoryNode> newTrail = trailTo(trail.getFirst(), target);
+        if (newTrail.getLast().path().equals(target)) {
+            trail.clear();
+            trail.addAll(newTrail);
+            render();
+            return;
         }
         root = target;
         scan();
+    }
+
+    /**
+     * The nodes from {@code scanRoot} down towards {@code target}, stopping at
+     * the deepest one that exists in the tree: {@code target}'s nearest
+     * existing ancestor, or just {@code scanRoot} when target is outside it.
+     */
+    static List<DirectoryNode> trailTo(DirectoryNode scanRoot, Path target) {
+        List<DirectoryNode> nodes = new ArrayList<>();
+        nodes.add(scanRoot);
+        if (!target.startsWith(scanRoot.path())) {
+            return nodes;
+        }
+        DirectoryNode node = scanRoot;
+        for (Path name : scanRoot.path().relativize(target)) {
+            if (name.toString().isEmpty()) {
+                break;      // target is the scan root
+            }
+            var child = node.child(name.toString());
+            if (child.isEmpty()) {
+                break;
+            }
+            node = child.get();
+            nodes.add(node);
+        }
+        return nodes;
+    }
+
+    /**
+     * What to rescan so {@code p} is re-read: {@code p} itself when its parent
+     * is a directory in the tree, else its highest ancestor that is missing
+     * from the tree (whose parent is). E.g. a Trash dir created since the scan.
+     */
+    static Path rescanTarget(DirectoryNode scanRoot, Path p) {
+        Path deepest = trailTo(scanRoot, p).getLast().path();
+        if (deepest.equals(p) || !p.startsWith(scanRoot.path())) {
+            return p;
+        }
+        return deepest.resolve(deepest.relativize(p).getName(0));
     }
 
     private void updateLargestFiles() {
         if (!filesToggle.isSelected() || trail.isEmpty()) {
             return;
         }
-        filesList.getItems().setAll(current().largestFiles(TOP_FILES, mode));
+        filesList.getItems().setAll(result.largestFiles(current(), TOP_FILES, mode));
     }
 
     private Path resolveRoot(Stage stage) {
@@ -447,32 +899,49 @@ public class DiskInventoryApp extends Application {
             render();
             return;
         }
-        DirectoryNode top = trail.getFirst();
-        if (top.path().getParent() == null) {
+        ScanResult top = result;
+        if (top.root().path().getParent() == null) {
             return;
         }
-        runScan(new Task<>() {
+        runTask(new Task<>() {
             @Override
-            protected DirectoryNode call() throws Exception {
+            protected ScanResult call() throws Exception {
                 return model.scanParent(top, progressReporter(this::updateMessage));
             }
-        });
+        }, false);
     }
 
     private void scan() {
         Path target = root;
-        runScan(new Task<>() {
+        runTask(new Task<>() {
             @Override
-            protected DirectoryNode call() throws Exception {
+            protected ScanResult call() throws Exception {
                 return model.scan(target, progressReporter(this::updateMessage));
             }
-        });
+        }, false);
+    }
+
+    /**
+     * Re-reads {@code p} (a directory or file under the scan root) and stays
+     * on the current directory, or its nearest ancestor if it is gone.
+     * Rescanning the scan root is a full scan.
+     */
+    private void rescan(Path p) {
+        ScanResult before = result;
+        Task<ScanResult> task = new Task<>() {
+            @Override
+            protected ScanResult call() throws Exception {
+                return model.rescan(before, p, progressReporter(this::updateMessage));
+            }
+        };
+        task.addEventHandler(WorkerStateEvent.WORKER_STATE_SUCCEEDED, e -> reloadTreeItem(p.getParent()));
+        runTask(task, true);
     }
 
     /** Stops the running scan and re-roots the analysis at its current position. */
     private void pivotToScanningDir() {
         Path target = scanningDir;
-        if (target == null || currentTask == null || !currentTask.isRunning()) {
+        if (target == null || !busy() || !pivotable) {
             return;
         }
         pivotTarget = target;
@@ -487,29 +956,42 @@ public class DiskInventoryApp extends Application {
         };
     }
 
-    private void runScan(Task<DirectoryNode> task) {
+    /**
+     * Runs a tree-producing task, one at a time. {@code keepTrail} keeps the
+     * view on the current directory (or its nearest surviving ancestor);
+     * otherwise the view starts at the new scan root.
+     */
+    private void runTask(Task<ScanResult> task, boolean keepTrail) {
+        if (busy()) {
+            return;
+        }
         currentTask = task;
+        pivotable = !keepTrail;
         pivotTarget = null;
         scanningDir = null;
         upButton.setDisable(true);
         rescanButton.setDisable(true);
         showScanActivity(true);
+        // "Analyze this path" would cancel a rescan or delete and lose the whole tree.
+        analyzeButton.setVisible(pivotable);
+        analyzeButton.setManaged(pivotable);
         chart.getData().clear();
 
         status.textProperty().bind(task.messageProperty());
         task.setOnSucceeded(e -> {
             scanFinished();
-            DirectoryNode result = task.getValue();
-            root = result.path();
+            Path at = keepTrail && !trail.isEmpty() ? current().path() : null;
+            result = task.getValue();
+            root = result.root().path();
             stage.setTitle("Disk Inventory — " + root);
             trail.clear();
-            trail.add(result);
+            trail.addAll(at != null ? trailTo(result.root(), at) : List.of(result.root()));
             render();
             refreshDf();
         });
         task.setOnFailed(e -> {
             scanFinished();
-            upButton.setDisable(false);
+            renderPrevious();
             status.setText("Scan failed: " + task.getException().getMessage());
         });
         task.setOnCancelled(e -> {
@@ -519,7 +1001,7 @@ public class DiskInventoryApp extends Application {
                 pivotTarget = null;
                 scan();
             } else {
-                upButton.setDisable(false);
+                renderPrevious();
                 status.setText("Scan cancelled");
             }
         });
@@ -528,11 +1010,23 @@ public class DiskInventoryApp extends Application {
         thread.start();
     }
 
+    /** After a failed or cancelled task: the previous result and trail are still valid, show them again. */
+    private void renderPrevious() {
+        if (result != null) {
+            render();
+        } else {
+            upButton.setDisable(false);
+        }
+    }
+
     private void scanFinished() {
         status.textProperty().unbind();
         rescanButton.setDisable(false);
         showScanActivity(false);
         currentTask = null;
+        deleteStop = null;
+        analyzeButton.setText("Analyze this path");
+        analyzeButton.getTooltip().setText(ANALYZE_TIP);
     }
 
     private void showScanActivity(boolean scanning) {
@@ -585,6 +1079,10 @@ public class DiskInventoryApp extends Application {
     private void render() {
         DirectoryNode node = current();
         chart.getData().clear();
+        // PieChart caches its label layout by geometry alone: refilled with
+        // the same sizes it skips placing the new labels, which stay at (0,0).
+        // Laying the empty chart out resets that cache.
+        chart.layout();
         renderBreadcrumb();
         crumbSize.setText(Sizes.human(node.totalSize(mode))
                 + (mode == SizeMode.ALLOCATED ? " on disk" : " logical"));
@@ -689,11 +1187,29 @@ public class DiskInventoryApp extends Application {
         tooltip.setStyle("-fx-font-family: monospace;");
         Tooltip.install(sliceNode, tooltip);
         if (target != null) {
+            // On hover, not per render: sharedBytes goes over every shared inode in the tree.
+            tooltip.setOnShowing(e -> {
+                long shared = result.sharedBytes(target.path(), mode);
+                tooltip.setText(shared > 0
+                        ? tooltipText + "\n" + Sizes.human(shared) + " shared with other directories"
+                        : tooltipText);
+            });
             sliceNode.setStyle("-fx-cursor: hand;");
             sliceNode.setOnMouseClicked(e -> {
-                trail.add(target);
-                render();
+                if (isPlainPrimaryClick(e)) {
+                    trail.add(target);
+                    render();
+                }
+            });
+            sliceNode.setOnContextMenuRequested(e -> {
+                showMenu(pathMenu(target.path(), true), sliceNode, e.getScreenX(), e.getScreenY());
+                e.consume();
             });
         }
+    }
+
+    /** A primary click that isn't macOS Ctrl+click, which opens the context menu instead. */
+    private static boolean isPlainPrimaryClick(MouseEvent e) {
+        return e.getButton() == MouseButton.PRIMARY && !e.isPopupTrigger() && !e.isControlDown();
     }
 }

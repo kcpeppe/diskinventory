@@ -35,7 +35,7 @@ public final class Main {
         boolean allocatedWorks = DiskUsageModel.allocatedSizeSupported();
         DirectoryNode tree;
         try {
-            tree = new DiskUsageModel().scan(root.toAbsolutePath().normalize());
+            tree = new DiskUsageModel().scan(root.toAbsolutePath().normalize()).root();
         } catch (IOException e) {
             System.err.println("scan failed: " + e.getMessage());
             return 1;

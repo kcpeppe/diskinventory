@@ -6,12 +6,20 @@ import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,6 +30,10 @@ class DiskUsageModelTest {
 
     private static void write(Path file, int bytes) throws IOException {
         Files.write(file, new byte[bytes]);
+    }
+
+    private static FileEntry entry(DirectoryNode node, String name) {
+        return node.files().stream().filter(f -> f.name().equals(name)).findFirst().orElseThrow();
     }
 
     @Test
@@ -35,7 +47,7 @@ class DiskUsageModelTest {
         Path nested = Files.createDirectory(sub.resolve("nested"));
         write(nested.resolve("d.bin"), 25);
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         assertEquals(150, result.directFileSize());
         assertEquals(475, result.totalSize());
@@ -58,7 +70,7 @@ class DiskUsageModelTest {
             write(dir.resolve("f.bin"), i * 100);
         }
 
-        List<DirectoryNode> children = model.scan(root).children();
+        List<DirectoryNode> children = model.scan(root).root().children();
 
         assertEquals(List.of("dir3", "dir2", "dir1"),
                 children.stream().map(DirectoryNode::name).toList());
@@ -72,7 +84,7 @@ class DiskUsageModelTest {
         Path b = Files.createDirectory(root.resolve("b"));
         write(b.resolve("y.bin"), 13);
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         long childSum = result.children().stream().mapToLong(DirectoryNode::totalSize).sum();
         assertEquals(result.totalSize(), result.directFileSize() + childSum);
@@ -80,7 +92,7 @@ class DiskUsageModelTest {
 
     @Test
     void emptyDirectoryIsZero(@TempDir Path root) throws IOException {
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         assertEquals(0, result.totalSize());
         assertEquals(0, result.directFileSize());
@@ -95,7 +107,7 @@ class DiskUsageModelTest {
         Files.createSymbolicLink(root.resolve("dirlink"), real);
         Files.createSymbolicLink(root.resolve("filelink"), real.resolve("big.bin"));
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         // Only the real directory and the real files contribute.
         assertEquals(1, result.children().size());
@@ -125,7 +137,7 @@ class DiskUsageModelTest {
             raf.setLength(16 * 1024 * 1024);    // a hole: no blocks written
         }
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         assertEquals(65536 + 16 * 1024 * 1024, result.totalSize(SizeMode.LOGICAL));
 
@@ -148,8 +160,9 @@ class DiskUsageModelTest {
         write(child.resolve("c.bin"), 4096);
         write(parent.resolve("p.bin"), 4096);
 
-        DirectoryNode known = model.scan(child);
-        DirectoryNode result = model.scanParent(known, (d, n, b) -> { });
+        ScanResult knownResult = model.scan(child);
+        DirectoryNode known = knownResult.root();
+        DirectoryNode result = model.scanParent(knownResult, (d, n, b) -> { }).root();
 
         assertEquals(known.totalSize(SizeMode.ALLOCATED) + result.directFileSize(SizeMode.ALLOCATED),
                 result.totalSize(SizeMode.ALLOCATED));
@@ -166,7 +179,7 @@ class DiskUsageModelTest {
         Path b = Files.createDirectory(root.resolve("b"));
         write(b.resolve("small.bin"), 100);
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         List<FileRef> top3 = result.largestFiles(3, SizeMode.LOGICAL);
         assertEquals(List.of("biggest.bin", "big.bin", "mid.bin"),
@@ -196,7 +209,7 @@ class DiskUsageModelTest {
         write(root.resolve("large.bin"), 500);
         write(root.resolve("medium.bin"), 100);
 
-        DirectoryNode result = model.scan(root);
+        DirectoryNode result = model.scan(root).root();
 
         assertEquals(List.of("large.bin", "medium.bin", "small.bin"),
                 result.files().stream().map(FileEntry::name).toList());
@@ -213,10 +226,11 @@ class DiskUsageModelTest {
         write(sibling.resolve("s.bin"), 300);
         write(parent.resolve("loose.bin"), 50);
 
-        DirectoryNode known = model.scan(child);
+        ScanResult knownResult = model.scan(child);
+        DirectoryNode known = knownResult.root();
 
         AtomicInteger visited = new AtomicInteger();
-        DirectoryNode result = model.scanParent(known, (dir, dirs, bytes) -> visited.incrementAndGet());
+        DirectoryNode result = model.scanParent(knownResult, (dir, dirs, bytes) -> visited.incrementAndGet()).root();
 
         assertEquals(parent, result.path());
         assertEquals(550, result.totalSize());
@@ -232,7 +246,9 @@ class DiskUsageModelTest {
     void scanParentOfFilesystemRootReturnsSameNode() throws IOException {
         DirectoryNode fsRoot = new DirectoryNode(Path.of("/"), 0, 0, 0, 0, List.of(), List.of(), 0);
 
-        assertSame(fsRoot, model.scanParent(fsRoot, (d, n, b) -> { }));
+        ScanResult known = new ScanResult(fsRoot, new InodeIndex());
+
+        assertSame(known, model.scanParent(known, (d, n, b) -> { }));
     }
 
     @Test
@@ -248,5 +264,164 @@ class DiskUsageModelTest {
     @EnabledOnOs({OS.MAC, OS.LINUX})    // Windows has no probe
     void allocatedSizesAreSupportedOnMacAndLinux() {
         assertTrue(DiskUsageModel.allocatedSizeSupported());
+    }
+
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    void sharedFileEntriesCarryNlinkAndFileKey(@TempDir Path root) throws IOException {
+        write(root.resolve("a"), 100);
+        Files.createLink(root.resolve("b"), root.resolve("a"));
+        write(root.resolve("c"), 100);
+        DirectoryNode result = model.scan(root).root();
+        FileEntry a = entry(result, "a"), b = entry(result, "b"), c = entry(result, "c");
+        assertEquals(2, a.nlink());
+        assertEquals(a.fileKey(), b.fileKey());
+        assertTrue(a.shared());
+        assertFalse(c.shared());
+        assertEquals(1, c.nlink());
+    }
+
+    private static final DiskUsageModel.ScanListener QUIET = (d, n, b) -> { };
+
+    @Test
+    void rescanPicksUpNewFiles(@TempDir Path root) throws IOException {
+        Path sub = Files.createDirectory(root.resolve("sub"));
+        write(sub.resolve("old.bin"), 100);
+        ScanResult r = model.scan(root);
+
+        write(sub.resolve("new.bin"), 300);
+        ScanResult after = model.rescan(r, sub, QUIET);
+
+        assertEquals(r.root().totalSize() + 300, after.root().totalSize());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanOfVanishedPathDropsIt(@TempDir Path root) throws IOException {
+        Path sub = Files.createDirectories(root.resolve("sub/deep"));
+        write(sub.resolve("x.bin"), 100);
+        write(root.resolve("keep.bin"), 50);
+        ScanResult r = model.scan(root);
+
+        try (var walk = Files.walk(root.resolve("sub"))) {
+            for (Path p : walk.sorted(Comparator.reverseOrder()).toList()) {
+                Files.delete(p);
+            }
+        }
+        ScanResult after = model.rescan(r, root.resolve("sub"), QUIET);
+
+        assertTrue(after.root().child("sub").isEmpty());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanOfNewPathInsertsIt(@TempDir Path root) throws IOException {
+        ScanResult r = model.scan(root);
+
+        Path fresh = Files.createDirectory(root.resolve("fresh"));
+        write(fresh.resolve("x.bin"), 200);
+        ScanResult after = model.rescan(r, fresh, QUIET);
+
+        assertEquals(200, after.root().child("fresh").orElseThrow().totalSize());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanWhenFileBecameDirectory(@TempDir Path root) throws IOException {
+        write(root.resolve("n"), 100);
+        ScanResult r = model.scan(root);
+
+        Files.delete(root.resolve("n"));
+        Files.createDirectory(root.resolve("n"));
+        write(root.resolve("n/y.bin"), 300);
+        ScanResult after = model.rescan(r, root.resolve("n"), QUIET);
+
+        assertTrue(after.root().files().stream().noneMatch(f -> f.name().equals("n")));
+        assertEquals(300, after.root().child("n").orElseThrow().totalSize());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanOfSingleFile(@TempDir Path root) throws IOException {
+        write(root.resolve("a.bin"), 100);
+        write(root.resolve("b.bin"), 10);
+        ScanResult r = model.scan(root);
+
+        write(root.resolve("a.bin"), 900);
+        ScanResult after = model.rescan(r, root.resolve("a.bin"), QUIET);
+
+        assertEquals(910, after.root().directFileSize());
+        assertEquals(900, entry(after.root(), "a.bin").size());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanOfScanRootIsFullScan(@TempDir Path root) throws IOException {
+        ScanResult r = model.scan(root);
+
+        write(root.resolve("a.bin"), 100);
+        ScanResult after = model.rescan(r, root, QUIET);
+
+        assertEquals(100, after.root().totalSize());
+        TestTrees.assertMatchesFreshScan(model, after);
+    }
+
+    @Test
+    void rescanOutsideScanRootRejected(@TempDir Path parent) throws IOException {
+        Path root = Files.createDirectory(parent.resolve("root"));
+        ScanResult r = model.scan(root);
+
+        assertThrows(IllegalArgumentException.class, () -> model.rescan(r, parent, QUIET));
+        assertThrows(IllegalArgumentException.class, () -> model.rescan(r, parent.resolve("rootx"), QUIET));
+    }
+
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    void rescanOfUnreadableDirectoryCountsAnError(@TempDir Path root) throws IOException {
+        Path locked = Files.createDirectory(root.resolve("locked"));
+        write(locked.resolve("x.bin"), 100);
+        ScanResult r = model.scan(root);
+
+        Files.setPosixFilePermissions(locked, Set.of());
+        try {
+            assumeFalse(Files.isReadable(locked), "running as root");
+            ScanResult after = model.rescan(r, locked, QUIET);
+            assertEquals(0, after.root().totalSize());
+            assertEquals(1, after.root().errorCount());
+        } finally {
+            Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    void directoryUnreadableAtScanIsCountedOnceAfterRescan(@TempDir Path root) throws IOException {
+        Path locked = Files.createDirectory(root.resolve("locked"));
+        write(locked.resolve("x.bin"), 100);
+        Files.setPosixFilePermissions(locked, Set.of());
+        try {
+            assumeFalse(Files.isReadable(locked), "running as root");
+            ScanResult r = model.scan(root);
+            assertEquals(1, r.root().errorCount());
+
+            ScanResult after = model.rescan(r, locked, QUIET);
+
+            assertEquals(1, after.root().errorCount());
+            TestTrees.assertMatchesFreshScan(model, after);
+        } finally {
+            Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("rwx------"));
+        }
+    }
+
+    @Test
+    void rescanWalkThatFindsThePathGoneYieldsNoNode(@TempDir Path root) {
+        // p vanishing between rescan's readAttributes and its walk: the walk's first callback.
+        DiskUsageModel.Visitor gone = new DiskUsageModel.Visitor((d, n, b) -> { }, null, null, new InodeIndex());
+        gone.visitFileFailed(root.resolve("p"), new NoSuchFileException(root.resolve("p").toString()));
+        assertNull(gone.result());
+
+        DiskUsageModel.Visitor denied = new DiskUsageModel.Visitor((d, n, b) -> { }, null, null, new InodeIndex());
+        denied.visitFileFailed(root.resolve("p"), new AccessDeniedException(root.resolve("p").toString()));
+        assertEquals(1, denied.result().errorCount());
     }
 }

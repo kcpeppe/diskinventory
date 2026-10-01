@@ -27,6 +27,14 @@ usage breakdown with a clickable pie chart — one slice per subdirectory, plus 
   the top 50 files under the current directory (recursive), biggest first. A
   directory tree of the whole disk sits in the left gutter, kept in sync with
   the pie: click a node to refocus, navigate the pie and the branch opens.
+  Right-click a slice or tree node to **Rescan** it; slices, tree nodes and
+  Largest-files rows (also Delete / Shift+Delete) offer **Move to Trash** and
+  **Delete permanently**. A delete always ends with a rescan of
+  the deleted path, so the tree matches the disk even after a failed or stopped
+  delete. A file with several hardlinks is charged once, to its owner (its
+  smallest path); the other links' directories show it as shared bytes, and the
+  delete dialog reports what is actually freed on disk, which is 0 while
+  another link survives.
 
 ## Run
 

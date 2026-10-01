@@ -5,7 +5,9 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
 
@@ -87,7 +89,15 @@ public final class DirectoryNode {
 
     /**
      * The {@code limit} largest files anywhere under this node (recursive),
-     * biggest first in the given mode. Bounded min-heap, O(files · log limit).
+     * biggest first in the given mode. A shared file appears once, under its
+     * smallest path within this node (its other links elsewhere in the subtree
+     * are dropped); {@code otherLinks} is left empty here since a {@link
+     * DirectoryNode} has no index to resolve them — see {@link
+     * ScanResult#largestFiles}. Bounded min-heap over unshared files,
+     * O(files · log limit); shared files are deduped by fileKey first and fed
+     * into the same heap at the end. A shared file smaller than everything in
+     * a full heap can never make the cut, so it is skipped before the dedup
+     * (pnpm/Nix homes have many small shared files).
      */
     public List<FileRef> largestFiles(int limit, SizeMode mode) {
         if (limit <= 0) {
@@ -95,17 +105,39 @@ public final class DirectoryNode {
         }
         PriorityQueue<FileRef> heap = new PriorityQueue<>(
                 Comparator.comparingLong(r -> r.file().size(mode)));
+        // Best link so far per shared file, with its resolved path so each link resolves once.
+        record Best(Path path, FileRef ref) {
+        }
+        Map<Object, Best> sharedBest = new HashMap<>();
         Deque<DirectoryNode> pending = new ArrayDeque<>();
         pending.push(this);
         while (!pending.isEmpty()) {
             DirectoryNode node = pending.pop();
             for (FileEntry file : node.files) {
-                heap.add(new FileRef(node.path, file));
-                if (heap.size() > limit) {
-                    heap.poll();
+                if (file.shared()) {
+                    // The heap's minimum only grows once full, so a skipped file stays out.
+                    if (heap.size() == limit && file.size(mode) < heap.peek().file().size(mode)) {
+                        continue;
+                    }
+                    Best best = sharedBest.get(file.fileKey());
+                    Path path = node.path.resolve(file.name());
+                    if (best == null || path.compareTo(best.path()) < 0) {
+                        sharedBest.put(file.fileKey(), new Best(path, new FileRef(node.path, file, List.of())));
+                    }
+                } else {
+                    heap.add(new FileRef(node.path, file, List.of()));
+                    if (heap.size() > limit) {
+                        heap.poll();
+                    }
                 }
             }
             node.children.forEach(pending::push);
+        }
+        for (Best best : sharedBest.values()) {
+            heap.add(best.ref());
+            if (heap.size() > limit) {
+                heap.poll();
+            }
         }
         List<FileRef> result = new ArrayList<>(heap);
         result.sort(Comparator.comparingLong((FileRef r) -> r.file().size(mode)).reversed());
